@@ -75,4 +75,5 @@ private:
     } mGBufferPass;
 
     uint32_t mInstanceRouteMask = Scene::kAllGeometryInstanceRenderRoutesMask;
+    bool mUseResolvedExecutionRoutes = false;
 };

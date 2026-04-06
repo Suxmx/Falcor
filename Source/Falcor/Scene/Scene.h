@@ -627,6 +627,12 @@ namespace Falcor
             NeedsBoth = 2,
         };
 
+        enum class GeometryInstanceRouteFilterMode
+        {
+            Authoring = 0,
+            Resolved = 1,
+        };
+
         /** Get the current runtime resolved route of a geometry instance.
             \param[in] instanceID Global geometry instance ID.
             \return Per-frame resolved route derived from authoring route and blend distance classification.
@@ -638,6 +644,16 @@ namespace Falcor
             \return World-space AABB for the instance.
         */
         AABB getGeometryInstanceWorldBounds(uint32_t instanceID) const;
+
+        /** Get triangle-mesh instance IDs accepted by the raster route filter.
+            \param[in] instanceRouteMask Route mask interpreted against the selected filter mode.
+            \param[in] routeFilterMode Selects authoring-route or resolved-route filtering.
+            \return Triangle-mesh instance IDs that survive the requested filter.
+        */
+        std::vector<uint32_t> getFilteredMeshInstanceIDs(
+            uint32_t instanceRouteMask,
+            GeometryInstanceRouteFilterMode routeFilterMode = GeometryInstanceRouteFilterMode::Authoring
+        ) const;
 
         /** Configure per-frame resolved-route classification for Blend instances.
             \param[in] enabled Enables Blend distance-band classification when true. Disabled keeps Blend conservative as NeedsBoth.
@@ -989,6 +1005,14 @@ namespace Falcor
             RasterizerState::CullMode cullMode,
             uint32_t instanceRouteMask
         );
+        void rasterize(
+            RenderContext* pRenderContext,
+            GraphicsState* pState,
+            ProgramVars* pVars,
+            RasterizerState::CullMode cullMode,
+            uint32_t instanceRouteMask,
+            GeometryInstanceRouteFilterMode routeFilterMode
+        );
 
         /** Render the scene using the rasterizer.
             This overload uses the supplied rasterizer states.
@@ -1006,6 +1030,15 @@ namespace Falcor
             const ref<RasterizerState>& pRasterizerStateCW,
             const ref<RasterizerState>& pRasterizerStateCCW,
             uint32_t instanceRouteMask
+        );
+        void rasterize(
+            RenderContext* pRenderContext,
+            GraphicsState* pState,
+            ProgramVars* pVars,
+            const ref<RasterizerState>& pRasterizerStateCW,
+            const ref<RasterizerState>& pRasterizerStateCCW,
+            uint32_t instanceRouteMask,
+            GeometryInstanceRouteFilterMode routeFilterMode
         );
 
         /** Get the required raytracing maximum attribute size for this scene.
@@ -1309,9 +1342,10 @@ namespace Falcor
             ResourceFormat ibFormat = ResourceFormat::Unknown;  ///< Index buffer format.
         };
 
-        std::vector<DrawArgs> createDrawArgs(uint32_t instanceRouteMask);
-        const std::vector<DrawArgs>& getDrawArgs(uint32_t instanceRouteMask);
+        std::vector<DrawArgs> createDrawArgs(uint32_t instanceRouteMask, GeometryInstanceRouteFilterMode routeFilterMode);
+        const std::vector<DrawArgs>& getDrawArgs(uint32_t instanceRouteMask, GeometryInstanceRouteFilterMode routeFilterMode);
         void clearFilteredDrawArgsCache();
+        void clearResolvedDrawArgsCache();
 
         GeometryTypeFlags mGeometryTypes;                           ///< Set of geometry types that exist in the scene.
 
@@ -1335,6 +1369,7 @@ namespace Falcor
         ref<Vao> mpCurveVao;                                        ///< Vertex array object for the global curve vertex/index buffers.
         std::vector<DrawArgs> mDrawArgs;                            ///< List of draw arguments for rasterizing the meshes in the scene.
         std::unordered_map<uint32_t, std::vector<DrawArgs>> mFilteredDrawArgsCache; ///< Cached route-filtered draw arguments.
+        std::unordered_map<uint32_t, std::vector<DrawArgs>> mResolvedFilteredDrawArgsCache; ///< Cached resolved-route-filtered draw arguments.
 
         // Triangle meshes
         std::vector<MeshDesc> mMeshDesc;                            ///< Copy of mesh data GPU buffer (mpMeshesBuffer).

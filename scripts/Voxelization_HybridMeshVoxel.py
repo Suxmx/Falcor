@@ -525,7 +525,7 @@ def connect_mesh_gbuffer(g, source_name, target_name):
     g.addEdge(f"{source_name}.specRough", f"{target_name}.specRough")
 
 
-def create_mesh_gbuffer(instance_route_mask=None):
+def create_mesh_gbuffer(instance_route_mask=None, use_resolved_execution_routes=False):
     props = {
         "outputSize": "Default",
         "samplePattern": "Center",
@@ -534,6 +534,8 @@ def create_mesh_gbuffer(instance_route_mask=None):
     }
     if instance_route_mask is not None:
         props["instanceRouteMask"] = int(instance_route_mask)
+    if use_resolved_execution_routes:
+        props["useResolvedExecutionRoutes"] = True
     return createPass("GBufferRaster", props)
 
 
@@ -709,7 +711,7 @@ def render_graph_hybrid(scene_hint, camera_plan, output_mode, graph_name=None):
 
     g = RenderGraph(graph_name or "ByObjectRoute")
 
-    mesh_gbuffer = create_mesh_gbuffer(HYBRID_MESH_EXECUTION_ROUTE_MASK)
+    mesh_gbuffer = create_mesh_gbuffer(HYBRID_MESH_EXECUTION_ROUTE_MASK, use_resolved_execution_routes=True)
     mesh_style = create_mesh_style_pass(
         shadow_bias,
         render_background,

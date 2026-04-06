@@ -35,6 +35,7 @@ const std::string kDepthPassProgramFile = "RenderPasses/GBuffer/GBuffer/DepthPas
 const std::string kGBufferPassProgramFile = "RenderPasses/GBuffer/GBuffer/GBufferRaster.3d.slang";
 const RasterizerState::CullMode kDefaultCullMode = RasterizerState::CullMode::Back;
 const char kInstanceRouteMask[] = "instanceRouteMask";
+const char kUseResolvedExecutionRoutes[] = "useResolvedExecutionRoutes";
 const char kHybridRequireFullMeshSource[] = "HybridMeshVoxel.requireFullMeshSource";
 
 // Additional output channels.
@@ -86,6 +87,7 @@ Properties GBufferRaster::getProperties() const
 {
     Properties props = GBuffer::getProperties();
     props[kInstanceRouteMask] = mInstanceRouteMask;
+    props[kUseResolvedExecutionRoutes] = mUseResolvedExecutionRoutes;
     return props;
 }
 
@@ -143,6 +145,8 @@ void GBufferRaster::parseProperties(const Properties& props)
 
     if (props.has(kInstanceRouteMask))
         mInstanceRouteMask = uint32_t(props[kInstanceRouteMask]) & Scene::kAllGeometryInstanceRenderRoutesMask;
+    if (props.has(kUseResolvedExecutionRoutes))
+        mUseResolvedExecutionRoutes = bool(props[kUseResolvedExecutionRoutes]);
 }
 
 void GBufferRaster::onSceneUpdates(RenderContext* pRenderContext, IScene::UpdateFlags sceneUpdates) {}
@@ -152,8 +156,11 @@ void GBufferRaster::execute(RenderContext* pRenderContext, const RenderData& ren
     GBuffer::execute(pRenderContext, renderData);
 
     auto& dict = renderData.getDictionary();
-    const uint32_t instanceRouteMask =
-        dict.getValue(kHybridRequireFullMeshSource, false) ? Scene::kAllGeometryInstanceRenderRoutesMask : mInstanceRouteMask;
+    const bool requireFullMeshSource = dict.getValue(kHybridRequireFullMeshSource, false);
+    const uint32_t instanceRouteMask = requireFullMeshSource ? Scene::kAllGeometryInstanceRenderRoutesMask : mInstanceRouteMask;
+    const auto routeFilterMode =
+        (!requireFullMeshSource && mUseResolvedExecutionRoutes) ? Scene::GeometryInstanceRouteFilterMode::Resolved
+                                                                : Scene::GeometryInstanceRouteFilterMode::Authoring;
 
     // Update frame dimension based on render pass output.
     auto pDepth = renderData.getTexture(kDepthName);
@@ -212,7 +219,14 @@ void GBufferRaster::execute(RenderContext* pRenderContext, const RenderData& ren
         mpFbo->attachDepthStencilTarget(pDepth);
         mDepthPass.pState->setFbo(mpFbo);
 
-        mpScene->rasterize(pRenderContext, mDepthPass.pState.get(), mDepthPass.pVars.get(), cullMode, instanceRouteMask);
+        mpScene->rasterize(
+            pRenderContext,
+            mDepthPass.pState.get(),
+            mDepthPass.pVars.get(),
+            cullMode,
+            instanceRouteMask,
+            routeFilterMode
+        );
     }
 
     // GBuffer pass.
@@ -255,7 +269,14 @@ void GBufferRaster::execute(RenderContext* pRenderContext, const RenderData& ren
         mGBufferPass.pState->setFbo(mpFbo); // Sets the viewport
 
         // Rasterize the scene.
-        mpScene->rasterize(pRenderContext, mGBufferPass.pState.get(), mGBufferPass.pVars.get(), cullMode, instanceRouteMask);
+        mpScene->rasterize(
+            pRenderContext,
+            mGBufferPass.pState.get(),
+            mGBufferPass.pVars.get(),
+            cullMode,
+            instanceRouteMask,
+            routeFilterMode
+        );
     }
 
     mFrameCount++;

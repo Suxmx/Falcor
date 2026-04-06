@@ -90,6 +90,25 @@ bool isGeometryInstanceRenderRouteEnabled(uint32_t routeMask, GeometryInstanceRe
     return (routeMask & getGeometryInstanceRenderRouteBit(route)) != 0u;
 }
 
+uint32_t getGeometryInstanceResolvedRouteMaskBit(Scene::GeometryInstanceResolvedRoute route)
+{
+    switch (route)
+    {
+    case Scene::GeometryInstanceResolvedRoute::MeshResolved:
+        return getGeometryInstanceRenderRouteBit(GeometryInstanceRenderRoute::MeshOnly);
+    case Scene::GeometryInstanceResolvedRoute::VoxelResolved:
+        return getGeometryInstanceRenderRouteBit(GeometryInstanceRenderRoute::VoxelOnly);
+    case Scene::GeometryInstanceResolvedRoute::NeedsBoth:
+    default:
+        return getGeometryInstanceRenderRouteBit(GeometryInstanceRenderRoute::Blend);
+    }
+}
+
+bool isGeometryInstanceResolvedRouteEnabled(uint32_t routeMask, Scene::GeometryInstanceResolvedRoute route)
+{
+    return (routeMask & getGeometryInstanceResolvedRouteMaskBit(route)) != 0u;
+}
+
 float getMinDistanceToAABB(const float3& point, const AABB& bounds)
 {
     const float3 clamped = max(bounds.minPoint, min(point, bounds.maxPoint));
@@ -396,6 +415,31 @@ AABB Scene::getGeometryInstanceWorldBounds(uint32_t instanceID) const
     }
 }
 
+std::vector<uint32_t> Scene::getFilteredMeshInstanceIDs(uint32_t instanceRouteMask, GeometryInstanceRouteFilterMode routeFilterMode) const
+{
+    instanceRouteMask &= kAllGeometryInstanceRenderRoutesMask;
+
+    std::vector<uint32_t> instanceIDs;
+    instanceIDs.reserve(mGeometryInstanceData.size());
+
+    for (uint32_t instanceID = 0; instanceID < mGeometryInstanceData.size(); ++instanceID)
+    {
+        const auto& instance = mGeometryInstanceData[instanceID];
+        if (instance.getType() != GeometryType::TriangleMesh)
+            continue;
+
+        const bool enabled =
+            routeFilterMode == GeometryInstanceRouteFilterMode::Resolved
+                ? isGeometryInstanceResolvedRouteEnabled(instanceRouteMask, getGeometryInstanceResolvedRoute(instanceID))
+                : isGeometryInstanceRenderRouteEnabled(instanceRouteMask, instance.getRenderRoute());
+
+        if (enabled)
+            instanceIDs.push_back(instanceID);
+    }
+
+    return instanceIDs;
+}
+
 void Scene::setGeometryInstanceResolvedRouteConfig(bool enabled, float blendStartDistance, float blendEndDistance)
 {
     const float clampedStart = std::max(0.f, blendStartDistance);
@@ -550,7 +594,34 @@ void Scene::rasterize(
     uint32_t instanceRouteMask
 )
 {
-    rasterize(pRenderContext, pState, pVars, mFrontClockwiseRS[cullMode], mFrontCounterClockwiseRS[cullMode], instanceRouteMask);
+    rasterize(
+        pRenderContext,
+        pState,
+        pVars,
+        cullMode,
+        instanceRouteMask,
+        GeometryInstanceRouteFilterMode::Authoring
+    );
+}
+
+void Scene::rasterize(
+    RenderContext* pRenderContext,
+    GraphicsState* pState,
+    ProgramVars* pVars,
+    RasterizerState::CullMode cullMode,
+    uint32_t instanceRouteMask,
+    GeometryInstanceRouteFilterMode routeFilterMode
+)
+{
+    rasterize(
+        pRenderContext,
+        pState,
+        pVars,
+        mFrontClockwiseRS[cullMode],
+        mFrontCounterClockwiseRS[cullMode],
+        instanceRouteMask,
+        routeFilterMode
+    );
 }
 
 void Scene::rasterize(
@@ -573,13 +644,34 @@ void Scene::rasterize(
     uint32_t instanceRouteMask
 )
 {
+    rasterize(
+        pRenderContext,
+        pState,
+        pVars,
+        pRasterizerStateCW,
+        pRasterizerStateCCW,
+        instanceRouteMask,
+        GeometryInstanceRouteFilterMode::Authoring
+    );
+}
+
+void Scene::rasterize(
+    RenderContext* pRenderContext,
+    GraphicsState* pState,
+    ProgramVars* pVars,
+    const ref<RasterizerState>& pRasterizerStateCW,
+    const ref<RasterizerState>& pRasterizerStateCCW,
+    uint32_t instanceRouteMask,
+    GeometryInstanceRouteFilterMode routeFilterMode
+)
+{
     FALCOR_PROFILE(pRenderContext, "rasterizeScene");
 
     pVars->setParameterBlock(kParameterBlockName, mpSceneBlock);
 
     auto pCurrentRS = pState->getRasterizerState();
     bool isIndexed = hasIndexBuffer();
-    const auto& drawArgs = getDrawArgs(instanceRouteMask);
+    const auto& drawArgs = getDrawArgs(instanceRouteMask, routeFilterMode);
 
     for (const auto& draw : drawArgs)
     {
@@ -1206,6 +1298,7 @@ void Scene::updateGeometryInstanceResolvedRoutes(bool forceUpdate)
     if (!forceUpdate && !mGeometryInstanceResolvedRoutesDirty && !cameraOrGeometryChanged)
         return;
 
+    bool resolvedRoutesChanged = mGeometryInstanceResolvedRoutes.size() != mGeometryInstanceData.size();
     mGeometryInstanceResolvedRoutes.resize(mGeometryInstanceData.size(), GeometryInstanceResolvedRoute::NeedsBoth);
 
     const bool hasCamera = !mCameras.empty() && mSelectedCamera < mCameras.size() && mCameras[mSelectedCamera] != nullptr;
@@ -1245,8 +1338,15 @@ void Scene::updateGeometryInstanceResolvedRoutes(bool forceUpdate)
             break;
         }
 
-        mGeometryInstanceResolvedRoutes[instanceID] = resolvedRoute;
+        if (mGeometryInstanceResolvedRoutes[instanceID] != resolvedRoute)
+        {
+            mGeometryInstanceResolvedRoutes[instanceID] = resolvedRoute;
+            resolvedRoutesChanged = true;
+        }
     }
+
+    if (resolvedRoutesChanged)
+        clearResolvedDrawArgsCache();
 
     mGeometryInstanceResolvedRoutesDirty = false;
 }
@@ -3112,10 +3212,10 @@ void Scene::setBlasUpdateMode(UpdateMode mode)
 void Scene::createDrawList()
 {
     clearFilteredDrawArgsCache();
-    mDrawArgs = createDrawArgs(kAllGeometryInstanceRenderRoutesMask);
+    mDrawArgs = createDrawArgs(kAllGeometryInstanceRenderRoutesMask, GeometryInstanceRouteFilterMode::Authoring);
 }
 
-std::vector<Scene::DrawArgs> Scene::createDrawArgs(uint32_t instanceRouteMask)
+std::vector<Scene::DrawArgs> Scene::createDrawArgs(uint32_t instanceRouteMask, GeometryInstanceRouteFilterMode routeFilterMode)
 {
     std::vector<DrawArgs> drawArgs;
     if (!mpMeshVao)
@@ -3139,13 +3239,26 @@ std::vector<Scene::DrawArgs> Scene::createDrawArgs(uint32_t instanceRouteMask)
         drawArgs.push_back(draw);
     };
 
+    auto isInstanceEnabled = [this, instanceRouteMask, routeFilterMode](uint32_t instanceID, const GeometryInstanceData& instance)
+    {
+        switch (routeFilterMode)
+        {
+        case GeometryInstanceRouteFilterMode::Resolved:
+            return isGeometryInstanceResolvedRouteEnabled(instanceRouteMask, getGeometryInstanceResolvedRoute(instanceID));
+        case GeometryInstanceRouteFilterMode::Authoring:
+        default:
+            return isGeometryInstanceRenderRouteEnabled(instanceRouteMask, instance.getRenderRoute());
+        }
+    };
+
     if (hasIndexBuffer())
     {
         std::vector<DrawIndexedArguments> drawClockwiseMeshes[2], drawCounterClockwiseMeshes[2];
 
         uint32_t rasterInstanceID = 0;
-        for (const auto& instance : mGeometryInstanceData)
+        for (uint32_t instanceID = 0; instanceID < mGeometryInstanceData.size(); ++instanceID)
         {
+            const auto& instance = mGeometryInstanceData[instanceID];
             if (instance.getType() != GeometryType::TriangleMesh)
                 continue;
 
@@ -3159,7 +3272,7 @@ std::vector<Scene::DrawArgs> Scene::createDrawArgs(uint32_t instanceRouteMask)
             draw.BaseVertexLocation = mesh.vbOffset;
             draw.StartInstanceLocation = rasterInstanceID++;
 
-            if (!isGeometryInstanceRenderRouteEnabled(instanceRouteMask, instance.getRenderRoute()))
+            if (!isInstanceEnabled(instanceID, instance))
                 continue;
 
             int i = use16Bit ? 0 : 1;
@@ -3176,8 +3289,9 @@ std::vector<Scene::DrawArgs> Scene::createDrawArgs(uint32_t instanceRouteMask)
         std::vector<DrawArguments> drawClockwiseMeshes, drawCounterClockwiseMeshes;
 
         uint32_t rasterInstanceID = 0;
-        for (const auto& instance : mGeometryInstanceData)
+        for (uint32_t instanceID = 0; instanceID < mGeometryInstanceData.size(); ++instanceID)
         {
+            const auto& instance = mGeometryInstanceData[instanceID];
             if (instance.getType() != GeometryType::TriangleMesh)
                 continue;
 
@@ -3190,7 +3304,7 @@ std::vector<Scene::DrawArgs> Scene::createDrawArgs(uint32_t instanceRouteMask)
             draw.StartVertexLocation = mesh.vbOffset;
             draw.StartInstanceLocation = rasterInstanceID++;
 
-            if (!isGeometryInstanceRenderRouteEnabled(instanceRouteMask, instance.getRenderRoute()))
+            if (!isInstanceEnabled(instanceID, instance))
                 continue;
 
             (instance.isWorldFrontFaceCW()) ? drawClockwiseMeshes.push_back(draw) : drawCounterClockwiseMeshes.push_back(draw);
@@ -3203,15 +3317,18 @@ std::vector<Scene::DrawArgs> Scene::createDrawArgs(uint32_t instanceRouteMask)
     return drawArgs;
 }
 
-const std::vector<Scene::DrawArgs>& Scene::getDrawArgs(uint32_t instanceRouteMask)
+const std::vector<Scene::DrawArgs>& Scene::getDrawArgs(uint32_t instanceRouteMask, GeometryInstanceRouteFilterMode routeFilterMode)
 {
     instanceRouteMask &= kAllGeometryInstanceRenderRoutesMask;
     if (instanceRouteMask == kAllGeometryInstanceRenderRoutesMask)
         return mDrawArgs;
 
-    auto it = mFilteredDrawArgsCache.find(instanceRouteMask);
-    if (it == mFilteredDrawArgsCache.end())
-        it = mFilteredDrawArgsCache.emplace(instanceRouteMask, createDrawArgs(instanceRouteMask)).first;
+    auto& filteredDrawArgsCache =
+        routeFilterMode == GeometryInstanceRouteFilterMode::Resolved ? mResolvedFilteredDrawArgsCache : mFilteredDrawArgsCache;
+
+    auto it = filteredDrawArgsCache.find(instanceRouteMask);
+    if (it == filteredDrawArgsCache.end())
+        it = filteredDrawArgsCache.emplace(instanceRouteMask, createDrawArgs(instanceRouteMask, routeFilterMode)).first;
 
     return it->second;
 }
@@ -3219,6 +3336,12 @@ const std::vector<Scene::DrawArgs>& Scene::getDrawArgs(uint32_t instanceRouteMas
 void Scene::clearFilteredDrawArgsCache()
 {
     mFilteredDrawArgsCache.clear();
+    clearResolvedDrawArgsCache();
+}
+
+void Scene::clearResolvedDrawArgsCache()
+{
+    mResolvedFilteredDrawArgsCache.clear();
 }
 
 void Scene::initGeomDesc(RenderContext* pRenderContext)
@@ -4981,6 +5104,18 @@ FALCOR_SCRIPT_BINDING(Scene)
         "blend_start_distance"_a,
         "blend_end_distance"_a,
         "enabled"_a = true
+    );
+    scene.def(
+        "get_filtered_mesh_instance_ids",
+        [](const Scene* pScene, uint32_t instanceRouteMask, bool useResolvedRoutes)
+        {
+            return pScene->getFilteredMeshInstanceIDs(
+                instanceRouteMask,
+                useResolvedRoutes ? Scene::GeometryInstanceRouteFilterMode::Resolved : Scene::GeometryInstanceRouteFilterMode::Authoring
+            );
+        },
+        "instance_route_mask"_a,
+        "use_resolved_routes"_a = false
     );
     scene.def(
         "get_geometry_instance_info",
