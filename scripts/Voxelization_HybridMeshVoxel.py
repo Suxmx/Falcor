@@ -122,6 +122,8 @@ ROUTE_MASK_MESH_ONLY = 1 << 1
 ROUTE_MASK_VOXEL_ONLY = 1 << 2
 HYBRID_MESH_EXECUTION_ROUTE_MASK = ROUTE_MASK_BLEND | ROUTE_MASK_MESH_ONLY
 HYBRID_VOXEL_EXECUTION_ROUTE_MASK = ROUTE_MASK_BLEND | ROUTE_MASK_VOXEL_ONLY
+HYBRID_RUNTIME_RESOLVED_ROUTE_SOURCE = None
+HYBRID_RUNTIME_RESOLVED_ROUTE_STATE = {"signature": None}
 
 
 def resolve_output_mode():
@@ -399,6 +401,44 @@ def apply_reference_routes(scene, scene_hint):
     return True
 
 
+def set_runtime_resolved_route_source(source):
+    global HYBRID_RUNTIME_RESOLVED_ROUTE_SOURCE, HYBRID_RUNTIME_RESOLVED_ROUTE_STATE
+    HYBRID_RUNTIME_RESOLVED_ROUTE_SOURCE = source
+    HYBRID_RUNTIME_RESOLVED_ROUTE_STATE = {"signature": None}
+
+
+def resolve_runtime_resolved_route_config():
+    if HYBRID_RUNTIME_RESOLVED_ROUTE_SOURCE is None:
+        return False, 0.0, 0.0
+
+    props = HYBRID_RUNTIME_RESOLVED_ROUTE_SOURCE.properties
+    blend_start_distance = max(0.0, float(props.get("blendStartDistance", 0.0)))
+    blend_end_distance = max(blend_start_distance, float(props.get("blendEndDistance", blend_start_distance)))
+    return True, blend_start_distance, blend_end_distance
+
+
+def sync_scene_resolved_route_config(scene):
+    global HYBRID_RUNTIME_RESOLVED_ROUTE_STATE
+    if scene is None:
+        return
+
+    enabled, blend_start_distance, blend_end_distance = resolve_runtime_resolved_route_config()
+    scene.set_geometry_instance_resolved_route_config(blend_start_distance, blend_end_distance, enabled)
+
+    signature = (enabled, round(blend_start_distance, 6), round(blend_end_distance, 6))
+    if HYBRID_RUNTIME_RESOLVED_ROUTE_STATE.get("signature") == signature:
+        return
+
+    HYBRID_RUNTIME_RESOLVED_ROUTE_STATE["signature"] = signature
+    if enabled:
+        print(
+            "[HybridMeshVoxel] resolved route band:",
+            f"{blend_start_distance:.2f} -> {blend_end_distance:.2f}",
+        )
+    else:
+        print("[HybridMeshVoxel] resolved route band: disabled")
+
+
 def apply_renderer_overrides(scene_hint, camera_plan, default_framebuffer=None):
     hide_ui = env_bool("HYBRID_HIDE_UI", False)
     open_profiler = env_bool("HYBRID_OPEN_PROFILER", True)
@@ -419,7 +459,8 @@ def apply_renderer_overrides(scene_hint, camera_plan, default_framebuffer=None):
 
     route_specs = resolve_reference_routes(scene_hint)
     wait_for_scene_hint = not bool(scene_hint)
-    if not camera_plan and not route_specs and not wait_for_scene_hint:
+    needs_continuous_updates = HYBRID_RUNTIME_RESOLVED_ROUTE_SOURCE is not None
+    if not camera_plan and not route_specs and not wait_for_scene_hint and not needs_continuous_updates:
         return
 
     setup_state = {
@@ -456,7 +497,9 @@ def apply_renderer_overrides(scene_hint, camera_plan, default_framebuffer=None):
                 camera_plan["reference_view"] if camera_plan["reference_view"] else "<explicit>",
             )
 
-        if setup_state["camera_done"] and setup_state["routes_done"]:
+        sync_scene_resolved_route_config(scene)
+
+        if setup_state["camera_done"] and setup_state["routes_done"] and not needs_continuous_updates:
             m.sceneUpdateCallback = None
 
     try:
@@ -464,7 +507,7 @@ def apply_renderer_overrides(scene_hint, camera_plan, default_framebuffer=None):
     except Exception:
         pass
 
-    if not (setup_state["camera_done"] and setup_state["routes_done"]):
+    if not (setup_state["camera_done"] and setup_state["routes_done"]) or needs_continuous_updates:
         m.sceneUpdateCallback = apply_scene_setup_once
 
 
@@ -686,6 +729,7 @@ def render_graph_hybrid(scene_hint, camera_plan, output_mode, graph_name=None):
             "blendExponent": blend_exponent,
         },
     )
+    set_runtime_resolved_route_source(blend_mask)
     composite = createPass("HybridCompositePass", {"viewMode": output_mode})
     tone_mapper = createPass("ToneMapper", {"autoExposure": False, "exposureCompensation": 0.0})
 
@@ -840,6 +884,7 @@ def create_runtime_execution_graphs(scene_hint, camera_plan, output_mode):
 
 
 def setup_render_graphs():
+    set_runtime_resolved_route_source(None)
     scene_hint = resolve_scene_hint()
     camera_plan = resolve_camera_plan(scene_hint)
     output_mode, output_pipeline = resolve_output_mode()

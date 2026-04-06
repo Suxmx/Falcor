@@ -54,6 +54,7 @@
 #include <sstream>
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <execution>
 
 namespace Falcor
@@ -88,6 +89,22 @@ bool isGeometryInstanceRenderRouteEnabled(uint32_t routeMask, GeometryInstanceRe
 {
     return (routeMask & getGeometryInstanceRenderRouteBit(route)) != 0u;
 }
+
+float getMinDistanceToAABB(const float3& point, const AABB& bounds)
+{
+    const float3 clamped = max(bounds.minPoint, min(point, bounds.maxPoint));
+    return length(clamped - point);
+}
+
+float getMaxDistanceToAABB(const float3& point, const AABB& bounds)
+{
+    float3 farthestCorner = bounds.minPoint;
+    farthestCorner.x = std::abs(point.x - bounds.maxPoint.x) > std::abs(point.x - bounds.minPoint.x) ? bounds.maxPoint.x : bounds.minPoint.x;
+    farthestCorner.y = std::abs(point.y - bounds.maxPoint.y) > std::abs(point.y - bounds.minPoint.y) ? bounds.maxPoint.y : bounds.minPoint.y;
+    farthestCorner.z = std::abs(point.z - bounds.maxPoint.z) > std::abs(point.z - bounds.minPoint.z) ? bounds.maxPoint.z : bounds.minPoint.z;
+    return length(farthestCorner - point);
+}
+
 const std::string kPrevCurveVertexBufferName = "prevCurveVertices";
 const std::string kSDFGridsArrayName = "sdfGrids";
 const std::string kCustomPrimitiveBufferName = "customPrimitives";
@@ -320,9 +337,81 @@ void Scene::setGeometryInstanceRenderRoute(uint32_t instanceID, GeometryInstance
     FALCOR_CHECK(instanceID < mGeometryInstanceData.size(), "'instanceID' ({}) is out of range.", instanceID);
     mGeometryInstanceData[instanceID].setRenderRoute(route);
     clearFilteredDrawArgsCache();
+    mGeometryInstanceResolvedRoutesDirty = true;
 
     if (mpGeometryInstancesBuffer)
         updateGeometryInstances(true);
+}
+
+Scene::GeometryInstanceResolvedRoute Scene::getGeometryInstanceResolvedRoute(uint32_t instanceID) const
+{
+    FALCOR_CHECK(instanceID < mGeometryInstanceData.size(), "'instanceID' ({}) is out of range.", instanceID);
+
+    if (instanceID < mGeometryInstanceResolvedRoutes.size())
+        return mGeometryInstanceResolvedRoutes[instanceID];
+
+    switch (mGeometryInstanceData[instanceID].getRenderRoute())
+    {
+    case GeometryInstanceRenderRoute::MeshOnly:
+        return GeometryInstanceResolvedRoute::MeshResolved;
+    case GeometryInstanceRenderRoute::VoxelOnly:
+        return GeometryInstanceResolvedRoute::VoxelResolved;
+    case GeometryInstanceRenderRoute::Blend:
+    default:
+        return GeometryInstanceResolvedRoute::NeedsBoth;
+    }
+}
+
+AABB Scene::getGeometryInstanceWorldBounds(uint32_t instanceID) const
+{
+    FALCOR_CHECK(instanceID < mGeometryInstanceData.size(), "'instanceID' ({}) is out of range.", instanceID);
+    FALCOR_ASSERT(mpAnimationController);
+
+    const auto& instance = mGeometryInstanceData[instanceID];
+    const auto& globalMatrices = mpAnimationController->getGlobalMatrices();
+    FALCOR_CHECK(instance.globalMatrixID < globalMatrices.size(), "'globalMatrixID' ({}) is out of range.", instance.globalMatrixID);
+    const float4x4& transform = globalMatrices[instance.globalMatrixID];
+
+    switch (instance.getType())
+    {
+    case GeometryType::TriangleMesh:
+    case GeometryType::DisplacedTriangleMesh:
+        return mMeshBBs[instance.geometryID].transform(transform);
+    case GeometryType::Curve:
+        return mCurveBBs[instance.geometryID].transform(transform);
+    case GeometryType::SDFGrid:
+    {
+        float3x3 transform3x3 = float3x3(transform);
+        transform3x3[0] = abs(transform3x3[0]);
+        transform3x3[1] = abs(transform3x3[1]);
+        transform3x3[2] = abs(transform3x3[2]);
+        const float3 center = transform.getCol(3).xyz();
+        const float3 halfExtent = transformVector(transform3x3, float3(0.5f));
+        return AABB(center - halfExtent, center + halfExtent);
+    }
+    case GeometryType::Custom:
+        return instance.geometryID < mCustomPrimitiveAABBs.size() ? mCustomPrimitiveAABBs[instance.geometryID] : AABB();
+    default:
+        return AABB();
+    }
+}
+
+void Scene::setGeometryInstanceResolvedRouteConfig(bool enabled, float blendStartDistance, float blendEndDistance)
+{
+    const float clampedStart = std::max(0.f, blendStartDistance);
+    const float clampedEnd = std::max(clampedStart, blendEndDistance);
+
+    if (mGeometryInstanceResolvedRouteConfig.enabled == enabled &&
+        mGeometryInstanceResolvedRouteConfig.blendStartDistance == clampedStart &&
+        mGeometryInstanceResolvedRouteConfig.blendEndDistance == clampedEnd)
+    {
+        return;
+    }
+
+    mGeometryInstanceResolvedRouteConfig.enabled = enabled;
+    mGeometryInstanceResolvedRouteConfig.blendStartDistance = clampedStart;
+    mGeometryInstanceResolvedRouteConfig.blendEndDistance = clampedEnd;
+    mGeometryInstanceResolvedRoutesDirty = true;
 }
 
 std::string Scene::getGeometryInstanceNodeName(uint32_t instanceID) const
@@ -1105,6 +1194,63 @@ void Scene::updateGeometryInstances(bool forceUpdate)
     }
 }
 
+void Scene::updateGeometryInstanceResolvedRoutes(bool forceUpdate)
+{
+    const bool cameraOrGeometryChanged =
+        is_set(mUpdates, IScene::UpdateFlags::CameraMoved) ||
+        is_set(mUpdates, IScene::UpdateFlags::CameraSwitched) ||
+        is_set(mUpdates, IScene::UpdateFlags::GeometryMoved) ||
+        is_set(mUpdates, IScene::UpdateFlags::MeshesChanged) ||
+        is_set(mUpdates, IScene::UpdateFlags::CurvesMoved);
+
+    if (!forceUpdate && !mGeometryInstanceResolvedRoutesDirty && !cameraOrGeometryChanged)
+        return;
+
+    mGeometryInstanceResolvedRoutes.resize(mGeometryInstanceData.size(), GeometryInstanceResolvedRoute::NeedsBoth);
+
+    const bool hasCamera = !mCameras.empty() && mSelectedCamera < mCameras.size() && mCameras[mSelectedCamera] != nullptr;
+    const float3 cameraPosW = hasCamera ? getCamera()->getPosition() : float3(0.f);
+    const float blendStartDistance = mGeometryInstanceResolvedRouteConfig.blendStartDistance;
+    const float blendEndDistance = mGeometryInstanceResolvedRouteConfig.blendEndDistance;
+
+    for (uint32_t instanceID = 0; instanceID < mGeometryInstanceData.size(); ++instanceID)
+    {
+        const auto authoringRoute = mGeometryInstanceData[instanceID].getRenderRoute();
+        GeometryInstanceResolvedRoute resolvedRoute = GeometryInstanceResolvedRoute::NeedsBoth;
+
+        switch (authoringRoute)
+        {
+        case GeometryInstanceRenderRoute::MeshOnly:
+            resolvedRoute = GeometryInstanceResolvedRoute::MeshResolved;
+            break;
+        case GeometryInstanceRenderRoute::VoxelOnly:
+            resolvedRoute = GeometryInstanceResolvedRoute::VoxelResolved;
+            break;
+        case GeometryInstanceRenderRoute::Blend:
+        default:
+            if (mGeometryInstanceResolvedRouteConfig.enabled && hasCamera)
+            {
+                const AABB worldBounds = getGeometryInstanceWorldBounds(instanceID);
+                if (worldBounds.valid())
+                {
+                    const float minDistance = getMinDistanceToAABB(cameraPosW, worldBounds);
+                    const float maxDistance = getMaxDistanceToAABB(cameraPosW, worldBounds);
+
+                    if (maxDistance <= blendStartDistance)
+                        resolvedRoute = GeometryInstanceResolvedRoute::MeshResolved;
+                    else if (minDistance >= blendEndDistance)
+                        resolvedRoute = GeometryInstanceResolvedRoute::VoxelResolved;
+                }
+            }
+            break;
+        }
+
+        mGeometryInstanceResolvedRoutes[instanceID] = resolvedRoute;
+    }
+
+    mGeometryInstanceResolvedRoutesDirty = false;
+}
+
 IScene::UpdateFlags Scene::updateRaytracingAABBData(bool forceUpdate)
 {
     // This function updates the global list of AABBs for all procedural primitives.
@@ -1466,6 +1612,7 @@ void Scene::finalize()
     setCameraController(mCamCtrlType);
     initializeCameras();
     addViewpoint();
+    updateGeometryInstanceResolvedRoutes(true);
     updateLights(true);
     updateGridVolumes(true);
     updateEnvMap(true);
@@ -2124,6 +2271,7 @@ IScene::UpdateFlags Scene::update(RenderContext* pRenderContext, double currentT
     mUpdates |= updateEnvMap(false);
     mUpdates |= updateGeometry(pRenderContext, false);
     mUpdates |= updateSDFGrids(pRenderContext);
+    updateGeometryInstanceResolvedRoutes(false);
     pRenderContext->submit();
 
     if (is_set(mUpdates, IScene::UpdateFlags::GeometryMoved))
@@ -4576,6 +4724,20 @@ inline std::string geometryInstanceRouteToPythonString(GeometryInstanceRenderRou
     }
 }
 
+inline std::string geometryInstanceResolvedRouteToPythonString(Scene::GeometryInstanceResolvedRoute route)
+{
+    switch (route)
+    {
+    case Scene::GeometryInstanceResolvedRoute::MeshResolved:
+        return "MeshResolved";
+    case Scene::GeometryInstanceResolvedRoute::VoxelResolved:
+        return "VoxelResolved";
+    case Scene::GeometryInstanceResolvedRoute::NeedsBoth:
+    default:
+        return "NeedsBoth";
+    }
+}
+
 inline GeometryInstanceRenderRoute parseGeometryInstanceRoutePython(const std::string& value)
 {
     const std::string normalized = toLowerString(value);
@@ -4592,6 +4754,7 @@ inline GeometryInstanceRenderRoute parseGeometryInstanceRoutePython(const std::s
 inline pybind11::dict toPythonGeometryInstanceInfo(const Scene& scene, uint32_t instanceID)
 {
     const auto& instance = scene.getGeometryInstance(instanceID);
+    const AABB worldBounds = scene.getGeometryInstanceWorldBounds(instanceID);
 
     pybind11::dict info;
     info["instance_id"] = instanceID;
@@ -4602,6 +4765,22 @@ inline pybind11::dict toPythonGeometryInstanceInfo(const Scene& scene, uint32_t 
     info["geometry_name"] = scene.getGeometryInstanceGeometryName(instanceID);
     info["material_name"] = scene.getGeometryInstanceMaterialName(instanceID);
     info["route"] = geometryInstanceRouteToPythonString(instance.getRenderRoute());
+    info["resolved_route"] = geometryInstanceResolvedRouteToPythonString(scene.getGeometryInstanceResolvedRoute(instanceID));
+    info["world_bounds"] = worldBounds;
+    info["world_radius"] = worldBounds.valid() ? pybind11::cast(worldBounds.radius()) : pybind11::none();
+
+    if (worldBounds.valid())
+    {
+        const float3 cameraPosW = scene.getCamera()->getPosition();
+        info["camera_distance_min"] = getMinDistanceToAABB(cameraPosW, worldBounds);
+        info["camera_distance_max"] = getMaxDistanceToAABB(cameraPosW, worldBounds);
+    }
+    else
+    {
+        info["camera_distance_min"] = pybind11::none();
+        info["camera_distance_max"] = pybind11::none();
+    }
+
     return info;
 }
 
@@ -4784,6 +4963,25 @@ FALCOR_SCRIPT_BINDING(Scene)
     scene.def_property_readonly("geometry_instance_count", &Scene::getGeometryInstanceCount);
     scene.def("getGeometryUVTiles", &Scene::getGeometryUVTiles, "geometryID"_a);
     scene.def_property_readonly("memory_usage", &Scene::getMemoryUsageInBytes);
+    scene.def("get_geometry_instance_world_bounds", &Scene::getGeometryInstanceWorldBounds, "instance_id"_a);
+    scene.def(
+        "get_geometry_instance_resolved_route",
+        [](const Scene* pScene, uint32_t instanceID)
+        {
+            return geometryInstanceResolvedRouteToPythonString(pScene->getGeometryInstanceResolvedRoute(instanceID));
+        },
+        "instance_id"_a
+    );
+    scene.def(
+        "set_geometry_instance_resolved_route_config",
+        [](Scene* pScene, float blendStartDistance, float blendEndDistance, bool enabled)
+        {
+            pScene->setGeometryInstanceResolvedRouteConfig(enabled, blendStartDistance, blendEndDistance);
+        },
+        "blend_start_distance"_a,
+        "blend_end_distance"_a,
+        "enabled"_a = true
+    );
     scene.def(
         "get_geometry_instance_info",
         [](const Scene* pScene, uint32_t instanceID)

@@ -620,6 +620,32 @@ namespace Falcor
         */
         void setGeometryInstanceRenderRoute(uint32_t instanceID, GeometryInstanceRenderRoute route);
 
+        enum class GeometryInstanceResolvedRoute
+        {
+            MeshResolved = 0,
+            VoxelResolved = 1,
+            NeedsBoth = 2,
+        };
+
+        /** Get the current runtime resolved route of a geometry instance.
+            \param[in] instanceID Global geometry instance ID.
+            \return Per-frame resolved route derived from authoring route and blend distance classification.
+        */
+        GeometryInstanceResolvedRoute getGeometryInstanceResolvedRoute(uint32_t instanceID) const;
+
+        /** Get the world-space bounds of a geometry instance.
+            \param[in] instanceID Global geometry instance ID.
+            \return World-space AABB for the instance.
+        */
+        AABB getGeometryInstanceWorldBounds(uint32_t instanceID) const;
+
+        /** Configure per-frame resolved-route classification for Blend instances.
+            \param[in] enabled Enables Blend distance-band classification when true. Disabled keeps Blend conservative as NeedsBoth.
+            \param[in] blendStartDistance Mesh side distance threshold.
+            \param[in] blendEndDistance Voxel side distance threshold.
+        */
+        void setGeometryInstanceResolvedRouteConfig(bool enabled, float blendStartDistance, float blendEndDistance);
+
         /** Get the scene-graph node name backing a geometry instance.
             \param[in] instanceID Global geometry instance ID.
             \return Node name or empty string if unavailable.
@@ -1267,6 +1293,7 @@ namespace Falcor
         void bindLights();
         void bindSelectedCamera();
         void bindParameterBlock();
+        void updateGeometryInstanceResolvedRoutes(bool forceUpdate);
 
         Scene(ref<Device> pDevice, SceneData&& sceneData);
 
@@ -1289,6 +1316,15 @@ namespace Falcor
         GeometryTypeFlags mGeometryTypes;                           ///< Set of geometry types that exist in the scene.
 
         std::vector<GeometryInstanceData> mGeometryInstanceData;    ///< Geometry instance data (for all types of geometry).
+        std::vector<GeometryInstanceResolvedRoute> mGeometryInstanceResolvedRoutes; ///< Cached per-frame resolved routes.
+
+        struct GeometryInstanceResolvedRouteConfig
+        {
+            bool enabled = false;
+            float blendStartDistance = 0.f;
+            float blendEndDistance = 0.f;
+        } mGeometryInstanceResolvedRouteConfig;
+        bool mGeometryInstanceResolvedRoutesDirty = true;
 
         bool mUseCompressedHitInfo = false;                         ///< True if scene should used compressed HitInfo (on scenes with triangles meshes only).
         bool mHas16BitIndices = false;                              ///< True if any meshes use 16-bit indices.
