@@ -6,6 +6,7 @@ REM 用法：
 REM   run_HybridMeshVoxel.bat
 REM   run_HybridMeshVoxel.bat cornell
 REM   run_HybridMeshVoxel.bat "E:\path\to\scene.pyscene" voxelrouteid far
+REM   run_HybridMeshVoxel.bat "E:\path\to\scene.pyscene" composite near ForceMeshPipeline
 
 set "MOGWAI=E:\GraduateDesign\Falcor_Cp\build\windows-vs2022\bin\Release\Mogwai.exe"
 set "SCRIPT=E:\GraduateDesign\Falcor_Cp\scripts\Voxelization_HybridMeshVoxel.py"
@@ -34,10 +35,17 @@ if "%~3"=="" (
     set "HYBRID_REFERENCE_VIEW=%~3"
 )
 
+if "%~4"=="" (
+    set "HYBRID_EXECUTION_MODE=ByObjectRoute"
+) else (
+    set "HYBRID_EXECUTION_MODE=%~4"
+)
+
 for %%I in ("%SCENE%") do set "HYBRID_SCENE_HINT=%%~nI"
 set "HYBRID_SCENE_PATH=%SCENE%"
 set "HYBRID_VOXELIZATION_BACKEND=CPU"
 set "HYBRID_HIDE_UI=0"
+set "HYBRID_OPEN_PROFILER=1"
 set "HYBRID_FRAMEBUFFER_WIDTH=1600"
 set "HYBRID_FRAMEBUFFER_HEIGHT=900"
 set "HYBRID_CPU_VOXEL_RESOLUTION=256"
@@ -79,8 +87,11 @@ echo   Scene:  %SCENE%
 echo   Hint:   %HYBRID_SCENE_HINT%
 echo   Mode:   %HYBRID_OUTPUT_MODE%
 echo   View:   %HYBRID_REFERENCE_VIEW%
+echo   Execution: %HYBRID_EXECUTION_MODE%
 echo   Backend: %HYBRID_VOXELIZATION_BACKEND%
+echo   Profiler: %HYBRID_OPEN_PROFILER%
 echo   AutoGenerate: %HYBRID_CPU_AUTO_GENERATE%
+echo   GUI switch: use Mogwai Graphs dropdown to select ByObjectRoute / MeshOnly / VoxelOnly
 echo.
 
 "%MOGWAI%" --script "%SCRIPT%" --scene "%SCENE%" --width=1600 --height=900

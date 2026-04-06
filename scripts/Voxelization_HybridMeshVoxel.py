@@ -97,6 +97,18 @@ COMPOSITE_VIEW_MODES = {
     "depthmismatch": "DepthMismatch",
 }
 
+HYBRID_EXECUTION_MODES = {
+    "byobjectroute": "ByObjectRoute",
+    "forcemeshpipeline": "ForceMeshPipeline",
+    "forcevoxelpipeline": "ForceVoxelPipeline",
+}
+
+RUNTIME_GRAPH_NAME_BY_EXECUTION_MODE = {
+    "ByObjectRoute": "ByObjectRoute",
+    "ForceMeshPipeline": "MeshOnly",
+    "ForceVoxelPipeline": "VoxelOnly",
+}
+
 ROUTE_NAME_MAP = {
     "blend": "Blend",
     "mesh": "MeshOnly",
@@ -121,6 +133,15 @@ def resolve_output_mode():
 
     valid = sorted(list(COMPOSITE_VIEW_MODES.values()) + ["MeshView"])
     raise RuntimeError(f"Unsupported HYBRID_OUTPUT_MODE: {requested}. Expected one of: {', '.join(valid)}")
+
+
+def resolve_execution_mode():
+    requested = (os.environ.get("HYBRID_EXECUTION_MODE", "ByObjectRoute").strip() or "ByObjectRoute").lower()
+    if requested in HYBRID_EXECUTION_MODES:
+        return HYBRID_EXECUTION_MODES[requested]
+
+    valid = sorted(set(HYBRID_EXECUTION_MODES.values()))
+    raise RuntimeError(f"Unsupported HYBRID_EXECUTION_MODE: {requested}. Expected one of: {', '.join(valid)}")
 
 
 def resolve_voxel_backend():
@@ -380,12 +401,18 @@ def apply_reference_routes(scene, scene_hint):
 
 def apply_renderer_overrides(scene_hint, camera_plan, default_framebuffer=None):
     hide_ui = env_bool("HYBRID_HIDE_UI", False)
+    open_profiler = env_bool("HYBRID_OPEN_PROFILER", True)
     default_width, default_height = default_framebuffer if default_framebuffer else (0, 0)
     framebuffer_width = env_int("HYBRID_FRAMEBUFFER_WIDTH", default_width)
     framebuffer_height = env_int("HYBRID_FRAMEBUFFER_HEIGHT", default_height)
 
     if hide_ui:
         m.ui = False
+
+    try:
+        m.profiler.enabled = open_profiler
+    except Exception:
+        pass
 
     if framebuffer_width > 0 and framebuffer_height > 0:
         m.resizeFrameBuffer(framebuffer_width, framebuffer_height)
@@ -441,6 +468,11 @@ def apply_renderer_overrides(scene_hint, camera_plan, default_framebuffer=None):
         m.sceneUpdateCallback = apply_scene_setup_once
 
 
+def log_graph_passes(graph_name, pass_names):
+    print("[HybridMeshVoxel] graph:", graph_name)
+    print("[HybridMeshVoxel] passes:", ", ".join(pass_names))
+
+
 def connect_mesh_gbuffer(g, source_name, target_name):
     g.addEdge(f"{source_name}.posW", f"{target_name}.posW")
     g.addEdge(f"{source_name}.normW", f"{target_name}.normW")
@@ -480,7 +512,7 @@ def create_mesh_style_pass(shadow_bias, render_background, ao_enabled, ao_streng
     )
 
 
-def create_voxel_chain(scene_hint):
+def create_voxel_chain(scene_hint, instance_route_mask=HYBRID_VOXEL_EXECUTION_ROUTE_MASK):
     voxel_backend = resolve_voxel_backend()
     allow_cache_fallback = env_bool("HYBRID_ALLOW_CACHE_FALLBACK", False)
     cache_plan = choose_cache_plan(scene_hint, voxel_backend, allow_cache_fallback)
@@ -505,27 +537,26 @@ def create_voxel_chain(scene_hint):
     voxel_output_resolution = env_int("HYBRID_VOXEL_OUTPUT_RESOLUTION", 0)
     voxel_pass = createPass(voxel_pass_name, voxel_pass_props)
     read_pass = createPass("ReadVoxelPass", {"binFile": cache_plan["bin_file"]} if cache_plan["bin_file"] else {})
-    marching_pass = createPass(
-        "RayMarchingDirectAOPass",
-        {
-            "drawMode": 0,
-            "outputResolution": voxel_output_resolution,
-            "instanceRouteMask": HYBRID_VOXEL_EXECUTION_ROUTE_MASK,
-            "checkEllipsoid": env_bool("HYBRID_VOXEL_CHECK_ELLIPSOID", True),
-            "checkVisibility": env_bool("HYBRID_VOXEL_CHECK_VISIBILITY", True),
-            "checkCoverage": env_bool("HYBRID_VOXEL_CHECK_COVERAGE", True),
-            "useMipmap": env_bool("HYBRID_VOXEL_USE_MIPMAP", True),
-            "renderBackground": env_bool("HYBRID_VOXEL_RENDER_BACKGROUND", True),
-            "transmittanceThreshold": env_float("HYBRID_VOXEL_TRANSMITTANCE_THRESHOLD", 5.0),
-            "aoEnabled": env_bool("HYBRID_VOXEL_AO_ENABLED", True),
-            "aoStrength": env_float("HYBRID_VOXEL_AO_STRENGTH", 0.55),
-            "aoRadius": env_float("HYBRID_VOXEL_AO_RADIUS", 6.0),
-            "aoStepCount": env_int("HYBRID_VOXEL_AO_STEP_COUNT", 3),
-            "aoDirectionSet": env_int("HYBRID_VOXEL_AO_DIRECTION_SET", 6),
-            "aoContactStrength": env_float("HYBRID_VOXEL_AO_CONTACT_STRENGTH", 0.75),
-            "aoUseStableRotation": env_bool("HYBRID_VOXEL_AO_USE_STABLE_ROTATION", True),
-        },
-    )
+    marching_pass_props = {
+        "drawMode": 0,
+        "outputResolution": voxel_output_resolution,
+        "checkEllipsoid": env_bool("HYBRID_VOXEL_CHECK_ELLIPSOID", True),
+        "checkVisibility": env_bool("HYBRID_VOXEL_CHECK_VISIBILITY", True),
+        "checkCoverage": env_bool("HYBRID_VOXEL_CHECK_COVERAGE", True),
+        "useMipmap": env_bool("HYBRID_VOXEL_USE_MIPMAP", True),
+        "renderBackground": env_bool("HYBRID_VOXEL_RENDER_BACKGROUND", True),
+        "transmittanceThreshold": env_float("HYBRID_VOXEL_TRANSMITTANCE_THRESHOLD", 5.0),
+        "aoEnabled": env_bool("HYBRID_VOXEL_AO_ENABLED", True),
+        "aoStrength": env_float("HYBRID_VOXEL_AO_STRENGTH", 0.55),
+        "aoRadius": env_float("HYBRID_VOXEL_AO_RADIUS", 6.0),
+        "aoStepCount": env_int("HYBRID_VOXEL_AO_STEP_COUNT", 3),
+        "aoDirectionSet": env_int("HYBRID_VOXEL_AO_DIRECTION_SET", 6),
+        "aoContactStrength": env_float("HYBRID_VOXEL_AO_CONTACT_STRENGTH", 0.75),
+        "aoUseStableRotation": env_bool("HYBRID_VOXEL_AO_USE_STABLE_ROTATION", True),
+    }
+    if instance_route_mask is not None:
+        marching_pass_props["instanceRouteMask"] = int(instance_route_mask)
+    marching_pass = createPass("RayMarchingDirectAOPass", marching_pass_props)
 
     return {
         "backend": voxel_backend,
@@ -535,6 +566,12 @@ def create_voxel_chain(scene_hint):
         "read_pass": read_pass,
         "marching_pass": marching_pass,
     }
+
+
+def resolve_voxel_default_framebuffer(voxel_output_resolution):
+    if voxel_output_resolution > 0:
+        return (voxel_output_resolution, voxel_output_resolution)
+    return (1920, 1080)
 
 
 def render_graph_mesh_view(scene_hint, camera_plan):
@@ -596,11 +633,15 @@ def render_graph_mesh_view(scene_hint, camera_plan):
         g.addEdge("HybridMeshDebugPass.color", "ToneMapper.src")
 
     g.markOutput("ToneMapper.dst")
+    log_graph_passes(
+        "VoxelizationHybridMeshVoxelMeshView",
+        ["MeshGBuffer", "MeshStyleDirectAOPass", "ToneMapper"] if pipeline == "style" else ["MeshGBuffer", "HybridMeshDebugPass", "ToneMapper"],
+    )
     apply_renderer_overrides(scene_hint, camera_plan)
     return g
 
 
-def render_graph_hybrid(scene_hint, camera_plan, output_mode):
+def render_graph_hybrid(scene_hint, camera_plan, output_mode, graph_name=None):
     shadow_bias = env_float("HYBRID_MESH_SHADOW_BIAS", 0.001)
     render_background = env_bool("HYBRID_MESH_RENDER_BACKGROUND", True)
     ao_enabled = env_bool("HYBRID_MESH_AO_ENABLED", True)
@@ -623,7 +664,7 @@ def render_graph_hybrid(scene_hint, camera_plan, output_mode):
         f"(exp={blend_exponent:.2f})",
     )
 
-    g = RenderGraph("VoxelizationHybridMeshVoxelStage4")
+    g = RenderGraph(graph_name or "ByObjectRoute")
 
     mesh_gbuffer = create_mesh_gbuffer(HYBRID_MESH_EXECUTION_ROUTE_MASK)
     mesh_style = create_mesh_style_pass(
@@ -679,32 +720,155 @@ def render_graph_hybrid(scene_hint, camera_plan, output_mode):
     g.addEdge("HybridCompositePass.color", "ToneMapper.src")
     g.markOutput("ToneMapper.dst")
 
-    if voxel_chain["output_resolution"] > 0:
-        default_framebuffer = (voxel_chain["output_resolution"], voxel_chain["output_resolution"])
-    else:
-        default_framebuffer = (1920, 1080)
+    log_graph_passes(
+        g.name,
+        [
+            "MeshGBuffer",
+            "MeshStyleDirectAOPass",
+            "HybridBlendMaskPass",
+            "VoxelizationPass",
+            "ReadVoxelPass",
+            "RayMarchingDirectAOPass",
+            "HybridCompositePass",
+            "ToneMapper",
+        ],
+    )
 
+    default_framebuffer = resolve_voxel_default_framebuffer(voxel_chain["output_resolution"])
     apply_renderer_overrides(scene_hint, camera_plan, default_framebuffer)
     return g
 
 
-def render_graph_stage4():
+def render_graph_force_mesh(scene_hint, camera_plan, graph_name=None):
+    shadow_bias = env_float("HYBRID_MESH_SHADOW_BIAS", 0.001)
+    render_background = env_bool("HYBRID_MESH_RENDER_BACKGROUND", True)
+    ao_enabled = env_bool("HYBRID_MESH_AO_ENABLED", True)
+    ao_strength = env_float("HYBRID_MESH_AO_STRENGTH", 0.55)
+    ao_radius = env_float("HYBRID_MESH_AO_RADIUS", 0.18)
+    ao_step_count = env_int("HYBRID_MESH_AO_STEP_COUNT", 3)
+    ao_direction_set = env_int("HYBRID_MESH_AO_DIRECTION_SET", 6)
+    ao_contact_strength = env_float("HYBRID_MESH_AO_CONTACT_STRENGTH", 0.75)
+    ao_use_stable_rotation = env_bool("HYBRID_MESH_AO_USE_STABLE_ROTATION", True)
+
+    g = RenderGraph(graph_name or "MeshOnly")
+
+    mesh_gbuffer = create_mesh_gbuffer()
+    mesh_style = create_mesh_style_pass(
+        shadow_bias,
+        render_background,
+        ao_enabled,
+        ao_strength,
+        ao_radius,
+        ao_step_count,
+        ao_direction_set,
+        ao_contact_strength,
+        ao_use_stable_rotation,
+    )
+    tone_mapper = createPass("ToneMapper", {"autoExposure": False, "exposureCompensation": 0.0})
+
+    g.addPass(mesh_gbuffer, "MeshGBuffer")
+    g.addPass(mesh_style, "MeshStyleDirectAOPass")
+    g.addPass(tone_mapper, "ToneMapper")
+
+    connect_mesh_gbuffer(g, "MeshGBuffer", "MeshStyleDirectAOPass")
+    g.addEdge("MeshStyleDirectAOPass.color", "ToneMapper.src")
+    g.markOutput("ToneMapper.dst")
+
+    log_graph_passes(
+        g.name,
+        ["MeshGBuffer", "MeshStyleDirectAOPass", "ToneMapper"],
+    )
+    apply_renderer_overrides(scene_hint, camera_plan)
+    return g
+
+
+def render_graph_force_voxel(scene_hint, camera_plan, graph_name=None):
+    voxel_chain = create_voxel_chain(scene_hint, instance_route_mask=None)
+    print("[HybridMeshVoxel] voxel backend:", voxel_chain["backend"])
+    print("[HybridMeshVoxel] voxel cache:", voxel_chain["cache_plan"]["bin_file"] if voxel_chain["cache_plan"]["bin_file"] else "<none>")
+
+    g = RenderGraph(graph_name or "VoxelOnly")
+    tone_mapper = createPass("ToneMapper", {"autoExposure": False, "exposureCompensation": 0.0})
+
+    g.addPass(voxel_chain["voxel_pass"], "VoxelizationPass")
+    g.addPass(voxel_chain["read_pass"], "ReadVoxelPass")
+    g.addPass(voxel_chain["marching_pass"], "RayMarchingDirectAOPass")
+    g.addPass(tone_mapper, "ToneMapper")
+
+    g.addEdge("VoxelizationPass.dummy", "ReadVoxelPass.dummy")
+    g.addEdge("ReadVoxelPass.vBuffer", "RayMarchingDirectAOPass.vBuffer")
+    g.addEdge("ReadVoxelPass.gBuffer", "RayMarchingDirectAOPass.gBuffer")
+    g.addEdge("ReadVoxelPass.pBuffer", "RayMarchingDirectAOPass.pBuffer")
+    g.addEdge("ReadVoxelPass.blockMap", "RayMarchingDirectAOPass.blockMap")
+    g.addEdge("RayMarchingDirectAOPass.color", "ToneMapper.src")
+    g.markOutput("ToneMapper.dst")
+
+    log_graph_passes(
+        g.name,
+        ["VoxelizationPass", "ReadVoxelPass", "RayMarchingDirectAOPass", "ToneMapper"],
+    )
+    default_framebuffer = resolve_voxel_default_framebuffer(voxel_chain["output_resolution"])
+    apply_renderer_overrides(scene_hint, camera_plan, default_framebuffer)
+    return g
+
+
+def create_runtime_execution_graphs(scene_hint, camera_plan, output_mode):
+    graphs = {
+        "ByObjectRoute": render_graph_hybrid(
+            scene_hint,
+            camera_plan,
+            output_mode,
+            graph_name=RUNTIME_GRAPH_NAME_BY_EXECUTION_MODE["ByObjectRoute"],
+        ),
+        "ForceMeshPipeline": render_graph_force_mesh(
+            scene_hint,
+            camera_plan,
+            graph_name=RUNTIME_GRAPH_NAME_BY_EXECUTION_MODE["ForceMeshPipeline"],
+        ),
+        "ForceVoxelPipeline": render_graph_force_voxel(
+            scene_hint,
+            camera_plan,
+            graph_name=RUNTIME_GRAPH_NAME_BY_EXECUTION_MODE["ForceVoxelPipeline"],
+        ),
+    }
+    print(
+        "[HybridMeshVoxel] runtime graphs:",
+        ", ".join(graph.name for graph in graphs.values()),
+    )
+    print("[HybridMeshVoxel] GUI switch:", "use Mogwai Graphs dropdown to select ByObjectRoute / MeshOnly / VoxelOnly")
+    return graphs
+
+
+def setup_render_graphs():
     scene_hint = resolve_scene_hint()
     camera_plan = resolve_camera_plan(scene_hint)
     output_mode, output_pipeline = resolve_output_mode()
+    execution_mode = resolve_execution_mode()
 
     print("[HybridMeshVoxel] scene hint:", scene_hint if scene_hint else "<empty>")
     print("[HybridMeshVoxel] output mode:", output_mode)
+    print("[HybridMeshVoxel] execution mode:", execution_mode)
     if os.environ.get("HYBRID_REFERENCE_VIEW", "").strip():
         print("[HybridMeshVoxel] reference view:", os.environ["HYBRID_REFERENCE_VIEW"].strip())
 
     if output_pipeline == "mesh":
-        return render_graph_mesh_view(scene_hint, camera_plan)
-    return render_graph_hybrid(scene_hint, camera_plan, output_mode)
+        if execution_mode != "ByObjectRoute":
+            raise RuntimeError("HYBRID_EXECUTION_MODE only applies to hybrid output modes. HYBRID_OUTPUT_MODE=MeshView already selects the dedicated mesh-view graph.")
+        graph = render_graph_mesh_view(scene_hint, camera_plan)
+        try:
+            m.addGraph(graph)
+        except NameError:
+            pass
+        return
+
+    graphs = create_runtime_execution_graphs(scene_hint, camera_plan, output_mode)
+    initial_graph = graphs[execution_mode]
+    try:
+        for graph in graphs.values():
+            m.addGraph(graph)
+        m.setActiveGraph(initial_graph)
+    except NameError:
+        pass
 
 
-Graph = render_graph_stage4()
-try:
-    m.addGraph(Graph)
-except NameError:
-    pass
+setup_render_graphs()
