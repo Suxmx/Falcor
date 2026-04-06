@@ -28,6 +28,9 @@ Texture3D<int> vBuffer;
 StructuredBuffer<PrimitiveBSDF> gBuffer;
 StructuredBuffer<Ellipsoid> pBuffer;
 Texture2D<uint4> blockMap;
+Texture2D<uint4> routeBlockMapMesh;
+Texture2D<uint4> routeBlockMapVoxel;
+StructuredBuffer<uint> resolvedRouteBuffer;
 
 cbuffer GridData
 {
@@ -44,6 +47,9 @@ cbuffer CB
     float shadowBias;
     uint drawMode;
     uint instanceRouteMask;
+    bool useResolvedExecutionRoutes;
+    uint resolvedRouteCount;
+    float resolvedRouteConfidenceThreshold;
     bool renderBackground;
     float transmittanceThreshold;
     bool aoEnabled;
@@ -72,6 +78,9 @@ static const uint kDrawModeAOOnly = 2;
 static const uint kDrawModeNormalDebug = 3;
 static const uint kDrawModeCoverageDebug = 4;
 static const uint kAllInstanceRouteMask = 0x7u;
+static const uint kRouteMaskBlend = 1u << uint(GeometryInstanceRenderRoute::Blend);
+static const uint kRouteMaskMeshOnly = 1u << uint(GeometryInstanceRenderRoute::MeshOnly);
+static const uint kRouteMaskVoxelOnly = 1u << uint(GeometryInstanceRenderRoute::VoxelOnly);
 
 #define MAX_ANALYTIC_LIGHTS 8
 

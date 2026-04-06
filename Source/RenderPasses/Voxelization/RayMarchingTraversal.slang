@@ -10,6 +10,37 @@ uint getGeometryInstanceRenderRouteBit(GeometryInstanceRenderRoute route)
     return 1u << uint(route);
 }
 
+uint getGeometryInstanceResolvedRouteBit(uint resolvedRoute)
+{
+    switch (resolvedRoute)
+    {
+    case 0u:
+        return kRouteMaskMeshOnly;
+    case 1u:
+        return kRouteMaskVoxelOnly;
+    case 2u:
+    default:
+        return kRouteMaskBlend;
+    }
+}
+
+uint4 loadActiveBlockMap(uint2 blockXY)
+{
+    if (!useResolvedExecutionRoutes || instanceRouteMask == kAllInstanceRouteMask)
+        return blockMap[blockXY];
+
+    const bool wantsMeshResolved = (instanceRouteMask & kRouteMaskMeshOnly) != 0u;
+    const bool wantsVoxelResolved = (instanceRouteMask & kRouteMaskVoxelOnly) != 0u;
+
+    if (wantsMeshResolved && !wantsVoxelResolved)
+        return routeBlockMapMesh[blockXY];
+
+    if (wantsVoxelResolved && !wantsMeshResolved)
+        return routeBlockMapVoxel[blockXY];
+
+    return blockMap[blockXY];
+}
+
 bool isAcceptedVoxelOffset(int offset)
 {
     PrimitiveBSDF bsdf = gBuffer[offset];
@@ -19,12 +50,24 @@ bool isAcceptedVoxelOffset(int offset)
     if (instanceRouteMask == kAllInstanceRouteMask)
         return true;
 
-    if (bsdf.identityConfidence <= 0.f || bsdf.dominantInstanceID == kInvalidVoxelInstanceID)
+    if (!useResolvedExecutionRoutes)
+    {
+        if (bsdf.identityConfidence <= 0.f || bsdf.dominantInstanceID == kInvalidVoxelInstanceID)
+            return true;
+
+        GeometryInstanceID instanceID = { bsdf.dominantInstanceID };
+        const GeometryInstanceRenderRoute route = gScene.getGeometryInstanceRenderRoute(instanceID);
+        return (instanceRouteMask & getGeometryInstanceRenderRouteBit(route)) != 0u;
+    }
+
+    if (
+        resolvedRouteCount == 0u || bsdf.identityConfidence < resolvedRouteConfidenceThreshold || bsdf.dominantInstanceID == kInvalidVoxelInstanceID ||
+        bsdf.dominantInstanceID >= resolvedRouteCount
+    )
         return true;
 
-    GeometryInstanceID instanceID = { bsdf.dominantInstanceID };
-    const GeometryInstanceRenderRoute route = gScene.getGeometryInstanceRenderRoute(instanceID);
-    return (instanceRouteMask & getGeometryInstanceRenderRouteBit(route)) != 0u;
+    const uint resolvedRoute = resolvedRouteBuffer[bsdf.dominantInstanceID];
+    return (instanceRouteMask & getGeometryInstanceResolvedRouteBit(resolvedRoute)) != 0u;
 }
 
 bool isSolidVoxel(int3 cellInt, out int offset)
@@ -39,7 +82,7 @@ bool isSolidBlock(int3 blockInt)
 {
     int component = blockInt.z / 32;
     uint value = 1 << blockInt.z % 32;
-    uint4 zMap = blockMap[blockInt.xy];
+    uint4 zMap = loadActiveBlockMap(blockInt.xy);
     switch (component)
     {
     case 0:

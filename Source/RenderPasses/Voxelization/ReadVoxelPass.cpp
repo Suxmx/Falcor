@@ -15,6 +15,12 @@ struct LegacyVoxelData
     SphericalFunc totalProjAreaFunc;
 };
 
+struct SolidVoxelBlockData
+{
+    uint32_t linearBlockIndex = 0xffffffffu;
+    uint32_t blockZ = 0xffffffffu;
+};
+
 }; // namespace
 
 ReadVoxelPass::ReadVoxelPass(ref<Device> pDevice, const Properties& props) : RenderPass(pDevice), gridData(VoxelizationBase::GlobalGridData)
@@ -59,6 +65,11 @@ RenderPassReflection ReadVoxelPass::reflect(const CompileData& compileData)
         .bindFlags(ResourceBindFlags::None)
         .format(ResourceFormat::RGBA32Uint)
         .texture2D(gridData.blockCount().x, gridData.blockCount().y);
+
+    reflector.addOutput(kSolidVoxelBlockData, kSolidVoxelBlockData)
+        .bindFlags(ResourceBindFlags::ShaderResource)
+        .format(ResourceFormat::Unknown)
+        .rawBuffer(static_cast<uint32_t>(gridData.solidVoxelCount * sizeof(SolidVoxelBlockData)));
 
     return reflector;
 }
@@ -121,6 +132,7 @@ void ReadVoxelPass::execute(RenderContext* pRenderContext, const RenderData& ren
             legacyVoxelDataBytes,
             blockMapBytes
         );
+        delete[] vBuffer;
         mComplete = true;
         return;
     }
@@ -160,6 +172,38 @@ void ReadVoxelPass::execute(RenderContext* pRenderContext, const RenderData& ren
     tryRead(f, offset, gridData.totalBlockCount() * sizeof(uint4), blockMap, fileSize);
     pBlockMap->setSubresourceBlob(0, blockMap, gridData.totalBlockCount() * sizeof(uint4));
     delete[] blockMap;
+
+    std::vector<SolidVoxelBlockData> solidVoxelBlockData(static_cast<size_t>(gridData.solidVoxelCount));
+    const uint2 blockCount = gridData.blockCount();
+    const size_t voxelCountX = static_cast<size_t>(gridData.voxelCount.x);
+    const size_t voxelCountY = static_cast<size_t>(gridData.voxelCount.y);
+    for (uint32_t z = 0; z < gridData.voxelCount.z; ++z)
+    {
+        const uint32_t blockZ = z / kVoxelBlockSize;
+        for (uint32_t y = 0; y < gridData.voxelCount.y; ++y)
+        {
+            const uint32_t blockY = y / kVoxelBlockSize;
+            for (uint32_t x = 0; x < gridData.voxelCount.x; ++x)
+            {
+                const size_t linearIndex = size_t(z) * voxelCountX * voxelCountY + size_t(y) * voxelCountX + size_t(x);
+                const int offsetValue = static_cast<int>(vBuffer[linearIndex]);
+                if (offsetValue < 0 || static_cast<size_t>(offsetValue) >= gridData.solidVoxelCount)
+                    continue;
+
+                SolidVoxelBlockData& blockData = solidVoxelBlockData[static_cast<size_t>(offsetValue)];
+                blockData.linearBlockIndex = (x / kVoxelBlockSize) + blockY * blockCount.x;
+                blockData.blockZ = blockZ;
+            }
+        }
+    }
+
+    ref<Buffer> pSolidVoxelBlockData = renderData.getResource(kSolidVoxelBlockData)->asBuffer();
+    pSolidVoxelBlockData->setBlob(
+        solidVoxelBlockData.data(),
+        0,
+        solidVoxelBlockData.size() * sizeof(SolidVoxelBlockData)
+    );
+    delete[] vBuffer;
 
     // VoxelData将拆分成PrimitiveBSDF和Ellipsoid
     ref<Buffer> pGBuffer = renderData.getResource(kGBuffer)->asBuffer();

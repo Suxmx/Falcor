@@ -26,6 +26,7 @@ public:
 
 private:
     void parseProperties(const Properties& props);
+    void updateResolvedRouteBuffer();
 
     ref<Scene> mpScene;
     ref<FullScreenPass> mpFullScreenPass;
@@ -33,6 +34,7 @@ private:
     ref<Texture> mpFallbackVoxelNormal;
     ref<Texture> mpFallbackVoxelConfidence;
     ref<Texture> mpFallbackVoxelInstanceID;
+    ref<Buffer> mpResolvedRouteBuffer;
 
     GridData& gridData;
     uint mDrawMode;
@@ -55,4 +57,7 @@ private:
     float mAORadius;
     float mAOContactStrength;
     float mTransmittanceThreshold100;
+    float mResolvedRouteConfidenceThreshold;
+    bool mUseResolvedExecutionRoutes;
+    uint32_t mResolvedRouteCount;
 };

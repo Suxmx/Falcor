@@ -2,6 +2,7 @@
 #include "Shading.slang"
 #include "RenderGraph/RenderPassStandardFlags.h"
 #include <algorithm>
+#include <vector>
 
 namespace
 {
@@ -28,6 +29,8 @@ const std::string kPropAODirectionSet = "aoDirectionSet";
 const std::string kPropAOContactStrength = "aoContactStrength";
 const std::string kPropAOUseStableRotation = "aoUseStableRotation";
 const std::string kPropInstanceRouteMask = "instanceRouteMask";
+const std::string kPropUseResolvedExecutionRoutes = "useResolvedExecutionRoutes";
+const std::string kPropResolvedRouteConfidenceThreshold = "resolvedRouteConfidenceThreshold";
 const char kHybridRequireFullVoxelSource[] = "HybridMeshVoxel.requireFullVoxelSource";
 
 enum class RayMarchingDirectAODrawMode : uint32_t
@@ -77,6 +80,9 @@ RayMarchingDirectAOPass::RayMarchingDirectAOPass(ref<Device> pDevice, const Prop
     mAORadius = 6.0f;
     mAOContactStrength = 0.75f;
     mTransmittanceThreshold100 = 5.0f;
+    mResolvedRouteConfidenceThreshold = 0.95f;
+    mUseResolvedExecutionRoutes = false;
+    mResolvedRouteCount = 0;
 
     parseProperties(props);
 }
@@ -118,6 +124,10 @@ void RayMarchingDirectAOPass::parseProperties(const Properties& props)
             mAOUseStableRotation = value;
         else if (key == kPropInstanceRouteMask)
             mInstanceRouteMask = uint32_t(value) & Scene::kAllGeometryInstanceRenderRoutesMask;
+        else if (key == kPropUseResolvedExecutionRoutes)
+            mUseResolvedExecutionRoutes = value;
+        else if (key == kPropResolvedRouteConfidenceThreshold)
+            mResolvedRouteConfidenceThreshold = std::clamp(float(value), 0.0f, 1.0f);
         else if (key == kPropOutputResolution)
         {
             mSelectedResolution = value;
@@ -148,6 +158,8 @@ Properties RayMarchingDirectAOPass::getProperties() const
     props[kPropAOContactStrength] = mAOContactStrength;
     props[kPropAOUseStableRotation] = mAOUseStableRotation;
     props[kPropInstanceRouteMask] = mInstanceRouteMask;
+    props[kPropUseResolvedExecutionRoutes] = mUseResolvedExecutionRoutes;
+    props[kPropResolvedRouteConfidenceThreshold] = mResolvedRouteConfidenceThreshold;
     props[kPropOutputResolution] = mSelectedResolution;
     props[kPropTransmittanceThreshold] = mTransmittanceThreshold100;
     return props;
@@ -178,6 +190,18 @@ RenderPassReflection RayMarchingDirectAOPass::reflect(const CompileData& compile
         .bindFlags(ResourceBindFlags::ShaderResource)
         .format(ResourceFormat::RGBA32Uint)
         .texture2D(gridData.blockCount().x, gridData.blockCount().y);
+
+    reflector.addInput(kRouteBlockMapMesh, kRouteBlockMapMesh)
+        .bindFlags(ResourceBindFlags::ShaderResource)
+        .format(ResourceFormat::RGBA32Uint)
+        .texture2D(gridData.blockCount().x, gridData.blockCount().y)
+        .flags(RenderPassReflection::Field::Flags::Optional);
+
+    reflector.addInput(kRouteBlockMapVoxel, kRouteBlockMapVoxel)
+        .bindFlags(ResourceBindFlags::ShaderResource)
+        .format(ResourceFormat::RGBA32Uint)
+        .texture2D(gridData.blockCount().x, gridData.blockCount().y)
+        .flags(RenderPassReflection::Field::Flags::Optional);
 
     reflector.addOutput(kOutputColor, "Color")
         .bindFlags(ResourceBindFlags::RenderTarget)
@@ -255,6 +279,8 @@ void RayMarchingDirectAOPass::execute(RenderContext* pRenderContext, const Rende
 
     const uint32_t instanceRouteMask =
         dict.getValue(kHybridRequireFullVoxelSource, false) ? Scene::kAllGeometryInstanceRenderRoutesMask : mInstanceRouteMask;
+    const bool useResolvedExecutionRoutes =
+        mUseResolvedExecutionRoutes && instanceRouteMask != Scene::kAllGeometryInstanceRenderRoutesMask;
 
     if (!mpFullScreenPass)
     {
@@ -282,7 +308,31 @@ void RayMarchingDirectAOPass::execute(RenderContext* pRenderContext, const Rende
     var[kVBuffer] = renderData.getTexture(kVBuffer);
     var[kGBuffer] = renderData.getResource(kGBuffer)->asBuffer();
     var[kPBuffer] = renderData.getResource(kPBuffer)->asBuffer();
-    var[kBlockMap] = renderData.getTexture(kBlockMap);
+    ref<Texture> pBlockMap = renderData.getTexture(kBlockMap);
+    ref<Texture> pRouteBlockMapMesh = renderData.getTexture(kRouteBlockMapMesh);
+    ref<Texture> pRouteBlockMapVoxel = renderData.getTexture(kRouteBlockMapVoxel);
+    var[kBlockMap] = pBlockMap;
+    var[kRouteBlockMapMesh] = pRouteBlockMapMesh ? pRouteBlockMapMesh : pBlockMap;
+    var[kRouteBlockMapVoxel] = pRouteBlockMapVoxel ? pRouteBlockMapVoxel : pBlockMap;
+
+    if (useResolvedExecutionRoutes)
+        updateResolvedRouteBuffer();
+    else
+        mResolvedRouteCount = 0;
+
+    if (!mpResolvedRouteBuffer)
+    {
+        const uint32_t fallbackRoute = static_cast<uint32_t>(Scene::GeometryInstanceResolvedRoute::NeedsBoth);
+        mpResolvedRouteBuffer = mpDevice->createStructuredBuffer(
+            sizeof(uint32_t),
+            1,
+            ResourceBindFlags::ShaderResource,
+            MemoryType::DeviceLocal,
+            &fallbackRoute,
+            false
+        );
+    }
+    var["resolvedRouteBuffer"] = mpResolvedRouteBuffer;
 
     auto cbGridData = var["GridData"];
     cbGridData["gridMin"] = gridData.gridMin;
@@ -296,6 +346,9 @@ void RayMarchingDirectAOPass::execute(RenderContext* pRenderContext, const Rende
     cb["shadowBias"] = mShadowBias100 / 100.0f / gridData.voxelSize.x;
     cb["drawMode"] = mDrawMode;
     cb["instanceRouteMask"] = instanceRouteMask;
+    cb["useResolvedExecutionRoutes"] = useResolvedExecutionRoutes;
+    cb["resolvedRouteCount"] = mResolvedRouteCount;
+    cb["resolvedRouteConfidenceThreshold"] = mResolvedRouteConfidenceThreshold;
     cb["renderBackground"] = mRenderBackground;
     cb["transmittanceThreshold"] = mTransmittanceThreshold100 / 100.0f;
     cb["aoEnabled"] = mAOEnabled;
@@ -344,6 +397,8 @@ void RayMarchingDirectAOPass::renderUI(Gui::Widgets& widget)
         mOptionsChanged = true;
     if (widget.checkbox("AO Stable Rotation", mAOUseStableRotation))
         mOptionsChanged = true;
+    if (widget.checkbox("Use Resolved Routes", mUseResolvedExecutionRoutes))
+        mOptionsChanged = true;
     if (widget.checkbox("Check Ellipsoid", mCheckEllipsoid))
         mOptionsChanged = true;
     if (widget.checkbox("Check Visibility", mCheckVisibility))
@@ -367,6 +422,8 @@ void RayMarchingDirectAOPass::renderUI(Gui::Widgets& widget)
     if (widget.slider("Shadow Bias(x100)", mShadowBias100, 0.0f, 0.2f))
         mOptionsChanged = true;
     if (widget.slider("Transmittance Threshold(x100)", mTransmittanceThreshold100, 0.0f, 10.0f))
+        mOptionsChanged = true;
+    if (widget.slider("Route Confidence", mResolvedRouteConfidenceThreshold, 0.0f, 1.0f))
         mOptionsChanged = true;
 
     static const uint kResolutions[] = {0, 32, 64, 128, 256, 512, 1024};
@@ -396,7 +453,40 @@ void RayMarchingDirectAOPass::setScene(RenderContext* pRenderContext, const ref<
     mpScene = pScene;
     mpFullScreenPass = nullptr;
     mFrameIndex = 0;
+    mpResolvedRouteBuffer = nullptr;
+    mResolvedRouteCount = 0;
 
     if (const auto pCamera = mpScene ? mpScene->getCamera() : nullptr)
         pCamera->setAspectRatio(mOutputResolution.x / static_cast<float>(mOutputResolution.y));
+}
+
+void RayMarchingDirectAOPass::updateResolvedRouteBuffer()
+{
+    if (!mpScene)
+    {
+        mResolvedRouteCount = 0;
+        return;
+    }
+
+    const uint32_t instanceCount = mpScene->getGeometryInstanceCount();
+    mResolvedRouteCount = instanceCount;
+
+    const uint32_t bufferElementCount = std::max(instanceCount, 1u);
+    if (!mpResolvedRouteBuffer || mpResolvedRouteBuffer->getElementCount() < bufferElementCount)
+    {
+        mpResolvedRouteBuffer = mpDevice->createStructuredBuffer(
+            sizeof(uint32_t),
+            bufferElementCount,
+            ResourceBindFlags::ShaderResource,
+            MemoryType::DeviceLocal,
+            nullptr,
+            false
+        );
+    }
+
+    std::vector<uint32_t> resolvedRoutes(bufferElementCount, static_cast<uint32_t>(Scene::GeometryInstanceResolvedRoute::NeedsBoth));
+    for (uint32_t instanceID = 0; instanceID < instanceCount; ++instanceID)
+        resolvedRoutes[instanceID] = static_cast<uint32_t>(mpScene->getGeometryInstanceResolvedRoute(instanceID));
+
+    mpResolvedRouteBuffer->setBlob(resolvedRoutes.data(), 0, bufferElementCount * sizeof(uint32_t));
 }

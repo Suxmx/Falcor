@@ -557,7 +557,7 @@ def create_mesh_style_pass(shadow_bias, render_background, ao_enabled, ao_streng
     )
 
 
-def create_voxel_chain(scene_hint, instance_route_mask=HYBRID_VOXEL_EXECUTION_ROUTE_MASK):
+def create_voxel_chain(scene_hint, instance_route_mask=HYBRID_VOXEL_EXECUTION_ROUTE_MASK, use_resolved_execution_routes=False):
     voxel_backend = resolve_voxel_backend()
     allow_cache_fallback = env_bool("HYBRID_ALLOW_CACHE_FALLBACK", False)
     cache_plan = choose_cache_plan(scene_hint, voxel_backend, allow_cache_fallback)
@@ -580,8 +580,17 @@ def create_voxel_chain(scene_hint, instance_route_mask=HYBRID_VOXEL_EXECUTION_RO
         }
 
     voxel_output_resolution = env_int("HYBRID_VOXEL_OUTPUT_RESOLUTION", 0)
+    route_confidence_threshold = env_float("HYBRID_VOXEL_ROUTE_CONFIDENCE_THRESHOLD", 0.95)
     voxel_pass = createPass(voxel_pass_name, voxel_pass_props)
     read_pass = createPass("ReadVoxelPass", {"binFile": cache_plan["bin_file"]} if cache_plan["bin_file"] else {})
+    route_prepare_pass = None
+    if use_resolved_execution_routes:
+        route_prepare_pass = createPass(
+            "VoxelRoutePreparePass",
+            {
+                "identityConfidenceThreshold": route_confidence_threshold,
+            },
+        )
     marching_pass_props = {
         "drawMode": 0,
         "outputResolution": voxel_output_resolution,
@@ -598,6 +607,8 @@ def create_voxel_chain(scene_hint, instance_route_mask=HYBRID_VOXEL_EXECUTION_RO
         "aoDirectionSet": env_int("HYBRID_VOXEL_AO_DIRECTION_SET", 6),
         "aoContactStrength": env_float("HYBRID_VOXEL_AO_CONTACT_STRENGTH", 0.75),
         "aoUseStableRotation": env_bool("HYBRID_VOXEL_AO_USE_STABLE_ROTATION", True),
+        "useResolvedExecutionRoutes": use_resolved_execution_routes,
+        "resolvedRouteConfidenceThreshold": route_confidence_threshold,
     }
     if instance_route_mask is not None:
         marching_pass_props["instanceRouteMask"] = int(instance_route_mask)
@@ -609,6 +620,7 @@ def create_voxel_chain(scene_hint, instance_route_mask=HYBRID_VOXEL_EXECUTION_RO
         "output_resolution": voxel_output_resolution,
         "voxel_pass": voxel_pass,
         "read_pass": read_pass,
+        "route_prepare_pass": route_prepare_pass,
         "marching_pass": marching_pass,
     }
 
@@ -700,7 +712,7 @@ def render_graph_hybrid(scene_hint, camera_plan, output_mode, graph_name=None):
     blend_end_distance = env_float("HYBRID_BLEND_END_DISTANCE", 3.25)
     blend_exponent = env_float("HYBRID_BLEND_EXPONENT", 1.0)
 
-    voxel_chain = create_voxel_chain(scene_hint)
+    voxel_chain = create_voxel_chain(scene_hint, use_resolved_execution_routes=True)
     print("[HybridMeshVoxel] voxel backend:", voxel_chain["backend"])
     print("[HybridMeshVoxel] voxel cache:", voxel_chain["cache_plan"]["bin_file"] if voxel_chain["cache_plan"]["bin_file"] else "<none>")
     print(
@@ -740,6 +752,7 @@ def render_graph_hybrid(scene_hint, camera_plan, output_mode, graph_name=None):
     g.addPass(blend_mask, "HybridBlendMaskPass")
     g.addPass(voxel_chain["voxel_pass"], "VoxelizationPass")
     g.addPass(voxel_chain["read_pass"], "ReadVoxelPass")
+    g.addPass(voxel_chain["route_prepare_pass"], "VoxelRoutePreparePass")
     g.addPass(voxel_chain["marching_pass"], "RayMarchingDirectAOPass")
     g.addPass(composite, "HybridCompositePass")
     g.addPass(tone_mapper, "ToneMapper")
@@ -749,10 +762,14 @@ def render_graph_hybrid(scene_hint, camera_plan, output_mode, graph_name=None):
     g.addEdge("MeshGBuffer.vbuffer", "HybridBlendMaskPass.vbuffer")
 
     g.addEdge("VoxelizationPass.dummy", "ReadVoxelPass.dummy")
+    g.addEdge("ReadVoxelPass.gBuffer", "VoxelRoutePreparePass.gBuffer")
+    g.addEdge("ReadVoxelPass.solidVoxelBlockData", "VoxelRoutePreparePass.solidVoxelBlockData")
     g.addEdge("ReadVoxelPass.vBuffer", "RayMarchingDirectAOPass.vBuffer")
     g.addEdge("ReadVoxelPass.gBuffer", "RayMarchingDirectAOPass.gBuffer")
     g.addEdge("ReadVoxelPass.pBuffer", "RayMarchingDirectAOPass.pBuffer")
     g.addEdge("ReadVoxelPass.blockMap", "RayMarchingDirectAOPass.blockMap")
+    g.addEdge("VoxelRoutePreparePass.routeBlockMapMesh", "RayMarchingDirectAOPass.routeBlockMapMesh")
+    g.addEdge("VoxelRoutePreparePass.routeBlockMapVoxel", "RayMarchingDirectAOPass.routeBlockMapVoxel")
 
     g.addEdge("MeshStyleDirectAOPass.color", "HybridCompositePass.meshColor")
     g.addEdge("MeshGBuffer.posW", "HybridCompositePass.meshPosW")
@@ -774,6 +791,7 @@ def render_graph_hybrid(scene_hint, camera_plan, output_mode, graph_name=None):
             "HybridBlendMaskPass",
             "VoxelizationPass",
             "ReadVoxelPass",
+            "VoxelRoutePreparePass",
             "RayMarchingDirectAOPass",
             "HybridCompositePass",
             "ToneMapper",
